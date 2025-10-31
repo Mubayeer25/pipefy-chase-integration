@@ -1,0 +1,1033 @@
+import configparser
+import json
+import sys
+from datetime import datetime
+
+import pytz
+import requests
+import urllib3
+from requests.adapters import HTTPAdapter
+from requests.auth import HTTPBasicAuth
+from urllib3.util.retry import Retry
+import os
+
+import general_helpers
+from chase_category_map import category_map
+from pipefy_helpers import Pipefy
+
+# Load configuration from the file
+config = configparser.ConfigParser()
+config.read("segredo.ini")
+
+# Suppress SSL warnings (since you're using verify=False)
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+pipefy_api_url = config.get("Pipefy", "pipefy_api_url")
+pipefy_api_token = config.get("Pipefy", "pipefy_api_token")
+
+# SETUP PIPELIB
+pipefy = Pipefy(pipefy_api_url, pipefy_api_token)
+
+# Basic Auth credentials
+
+timeout = 5  # Reduced from 10 seconds for faster responses
+max_retry = 2  # Reduced retry attempts to fail faster
+
+# Chase login details
+# chase_username = None
+# chase_password = None
+test_state = False
+
+def get_chase_url():
+    return config.get("Chase", "CHASE_URL_TEST") if test_state else config.get("Chase", "CHASE_URL_PROD")
+
+def get_chase_credentials():
+    """Get the appropriate Chase credentials based on current test_state"""
+    if test_state:
+        username = "ross.holmes@theupandupgroup.com"
+        password = ">.aiz){W"
+    else:
+        username = "ross.holmes@theupandupgroup.com"
+        password = ">.aiz){W"
+    return username, password
+
+def get_basic_auth():
+    """Get the appropriate basic auth object based on current test_state"""
+    username, password = get_chase_credentials()
+    return HTTPBasicAuth(username, password)
+
+def get_current_environment_info():
+    """Get debug information about current environment settings"""
+    username, password = get_chase_credentials()
+    return {
+        "test_state": test_state,
+        "environment": "QA" if test_state else "Live",
+        "chase_url": get_chase_url(),
+        "username": username,
+        "password_length": len(password) if password else 0
+    }
+
+configID = "1"
+
+# Create a session object
+session = requests.Session()
+
+# Define the retry strategy
+retries = Retry(
+    total=max_retry,  # Retry up to max_retry times
+    backoff_factor=2,  # Delay between retries (1s, 2s, 4s, etc.)
+    # status_forcelist=[500, 502, 503, 504],  # Only retry on these HTTP status codes
+    allowed_methods=["GET"],  # Retry only GET requests
+)
+
+# Mount the adapter with the retry strategy to HTTPS requests
+adapter = HTTPAdapter(max_retries=retries)
+session.mount("https://", adapter)
+session.mount("http://", adapter)
+
+billing_categories = {
+    "retainer:inscope": 428,
+    "retainer:outofscope": 427,
+    "project": 868,
+}
+oStamp = {}
+
+tz = pytz.timezone("Africa/Johannesburg")
+
+# Note: basic_auth is now generated dynamically via get_basic_auth() function
+
+
+def create_job_bag(client_id, product_id, category_id, card_data):
+    #####
+    ## Creates a new job bag in Chase using provided client, product, and category IDs,
+    ## along with card data from Pipefy.
+    #####
+    try:
+        element = None
+        campaign_year = card_data.get("campaign_year","")
+        campaign_name = card_data.get("campaign_name")
+        job_name = card_data.get("job_name", "")
+        #####
+        ## Year – Product – Product/Campaign name – Element descriptor
+        ## For example:
+        ## 2025 – Brand – Summer Campaign – OOH
+        ## 2025 – MFS – Momo 1G – Digital
+        #####
+        print(f"campaign_year: {campaign_year}, campaign_name: {campaign_name}, job_name: {job_name}\n")
+        if campaign_name is None:
+            element = f"{campaign_year}-{job_name}"
+        else:
+            element = f"{campaign_year}-{campaign_name}-{job_name}"
+
+        if len(element) > 100:
+            element = element[:100]
+
+        url = f"{get_chase_url()}/api/Job/AddNew?customerid={client_id}&productid={product_id}&element={element}&categoryid={category_id}"
+        headers = {
+            "ConfigID": configID,
+        }
+
+        response_obj = requests.post(
+            url, auth=get_basic_auth(), headers=headers, timeout=timeout, verify=False
+        )
+
+        job_bag_id = response_obj.json()
+
+        if response_obj.status_code != 200:
+            # print(resp.text)
+            error_message = response_obj.text
+            if isinstance(response_obj, object):
+                response_json_obj = response_obj.json()
+                print(f"response_json_obj: {response_json_obj}")
+                if response_json_obj.get("error") and response_json_obj.get("message"):
+                    error_message = (
+                        response_json_obj.get("error")
+                        + ": "
+                        + response_json_obj.get("message")
+                    )
+                elif response_json_obj.get("error") and not response_json_obj.get(
+                    "message"
+                ):
+                    error_message = response_json_obj.get("error")
+            return {}, error_message, response_obj.status_code
+
+        return (
+            str(job_bag_id),
+            "Chase create job bag status=200,",
+            response_obj.status_code,
+        )
+    except requests.exceptions.Timeout:
+        # print("Took too long to respond")
+        return {}, "Chase took too long to respond, Probably a vpn issue", 108
+    except Exception as e:  ## EXCEPTION MUST BE THE LAST HANDLER
+        e_type, e_object, e_traceback = sys.exc_info()
+        estr = f"create_job_bag method returned exception ERROR line {e_traceback.tb_lineno}: error message => {str(e)}."
+        return {}, estr, 106
+
+
+def update_job_bag_notes(job_bag_obj, card_details, ostamp):
+    #####
+    ## Updates an existing job bag in Chase with new details from Pipefy.
+    #####
+    try:
+        pipe_id = card_details["pipe_object"].get("id")
+        current_board = card_details["pipe_object"].get("name")
+
+        updated_notes = None
+        card_url = card_details.get("card_url")
+        
+        # Get the current notes, or use an empty string if not present
+        current_notes = job_bag_obj.get("Notes")
+        # Prepare the new note to add
+        new_note = f"{current_board} Card Link: {card_url}"
+        # Combine with a newline if current_notes is not empty
+        if current_notes:
+            job_bag_obj["EstHours"] = None
+            updated_notes = current_notes + f"<br>{new_note}"
+        else:
+            updated_notes = new_note
+        
+        if len(updated_notes) > 8000:
+            updated_notes = updated_notes[:8000]
+
+        job_bag_obj["Notes"] = updated_notes
+
+        # print(f"current_notes:{current_notes},\n\n new_note:{new_note}, \n\n updated_notes: {job_bag_obj['Notes']}\n\n")
+        # print(f"est hours: {job_bag_obj['EstHours']}")
+        
+        # updated_notes = f"Creative card <br><br> Production card <br><br> Media card <br><br> Social card <br><br> Account Management Card Link: {card_url}"
+        
+        # Assign the updated notes back to the job bag object
+
+        url = f"{get_chase_url()}/api/Job/Update"
+
+        update_headers = {
+            "Content-Type": "application/json",
+            "ConfigID": configID,
+        }
+
+        response_obj = requests.post(
+            url,
+            auth=get_basic_auth(),
+            headers=update_headers,
+            json=job_bag_obj,
+            timeout=20,
+            verify=False,
+        )
+        if response_obj:
+            if response_obj.status_code != 200:
+                # print(resp.text)
+                error_message = response_obj.text
+                if isinstance(response_obj, object):
+                    response_json_obj = response_obj.json()
+                    print(f"response_json_obj: {response_json_obj}")
+                    if response_json_obj.get("error") and response_json_obj.get("message"):
+                        error_message = (
+                            response_json_obj.get("error")
+                            + ": "
+                            + response_json_obj.get("message")
+                        )
+                    elif response_json_obj.get("error") and not response_json_obj.get(
+                        "message"
+                    ):
+                        error_message = response_json_obj.get("error")
+                return {}, error_message, response_obj.status_code
+        
+            return True, "Chase update Job Bag Notes status=200", response_obj.status_code
+        else:
+            return {}, f"Chase update Job Bag Notes failed", 108
+
+    except requests.exceptions.Timeout:
+        # print("Took too long to respond")
+        return {}, "Chase took too long to respond, Probably a vpn issue", 108
+    except Exception as e:  ## EXCEPTION MUST BE THE LAST HANDLER
+        e_type, e_object, e_traceback = sys.exc_info()
+        estr = f"update_job_bag_notes method returned exception ERROR line {e_traceback.tb_lineno}: error message => {str(e)}."
+        return {}, estr, 106
+    
+def get_client_id(client_name):
+    #####
+    ## Retrieves the client ID from Chase based on the provided client name.
+    #####
+    oStamp["time"] = datetime.now(tz).strftime("%Y:%m:%d %H:%M:%S")
+    response_obj = None
+    try:
+
+        url = f"{get_chase_url()}/api/Client/Search/{client_name}"
+        headers = {
+            "ConfigID": configID,
+        }
+
+        response_obj = session.get(
+            url,
+            auth=get_basic_auth(),  # Basic Auth
+            headers=headers,  # Custom headers
+            verify=False,  # Disable SSL verification (use True in production)
+            timeout=timeout,  # Timeout in seconds
+        )
+
+        # response_obj = requests.get(url, auth=basic_auth, headers=headers, timeout=20, verify=False)
+
+        # client_id = "70570"
+        if response_obj.status_code == 200:
+            if isinstance(response_obj.json(), list) and len(response_obj.json()) > 0:
+                client_id = str(response_obj.json()[0].get("ClientID"))
+            else:
+                return {}, "Chase client not found", 108
+        else:
+            # print(resp.text)
+            error_message = response_obj.text
+            if isinstance(response_obj, object):
+                response_json_obj = response_obj.json()
+                print(f"response_json_obj: {response_json_obj}")
+                if response_json_obj.get("error") and response_json_obj.get("message"):
+                    error_message = (
+                        response_json_obj.get("error")
+                        + ": "
+                        + response_json_obj.get("message")
+                    )
+                elif response_json_obj.get("error") and not response_json_obj.get(
+                    "message"
+                ):
+                    error_message = response_json_obj.get("error")
+            return {}, error_message, response_obj.status_code
+
+        return client_id, "Chase get client status=200,", response_obj.status_code
+    except ValueError as e:
+        # Handle the ValueError specifically for client ID index issue
+        e_type, e_object, e_traceback = sys.exc_info()
+        error_message = f"ERROR line {e_traceback.tb_lineno}: error message => {str(e)}. response_obj: {response_obj.text}"
+        return {}, error_message, 108
+    except requests.exceptions.RequestException as e:
+        # Catch all requests-related exceptions
+        # e.add_note(response_obj.status_code)
+        resp_obj, status_code = general_helpers.fnLogToPapertrail(oStamp, e)
+        return {}, "Chase took too long to respond, Probably a vpn issue", e
+    except Exception as e:  ## EXCEPTION MUST BE THE LAST HANDLER
+        e_type, e_object, e_traceback = sys.exc_info()
+        estr = f"get_client_id method returned exception ERROR line {e_traceback.tb_lineno}: error message => {str(e)}."
+        return {}, estr, 106
+
+    finally:
+        session.close()
+
+
+def get_product_id(product_name, client_id):
+    #####
+    ## Retrieves the product ID from Chase based on the provided product name and client ID.
+    #####
+    product_details = {}
+    # product_id = 4452
+    try:
+
+        url = f"{get_chase_url()}/api/Product/CustomerID/{client_id}"
+
+        headers = {
+            "ConfigID": configID,
+        }
+
+        response_obj = session.get(
+            url,
+            auth=get_basic_auth(),  # Basic Auth
+            headers=headers,  # Custom headers
+            verify=False,  # Disable SSL verification (use True in production)
+            timeout=timeout,  # Timeout in seconds
+        )
+
+        if response_obj.status_code != 200:
+            # print(resp.text)
+            error_message = response_obj.text
+            if isinstance(response_obj, object):
+                response_json_obj = response_obj.json()
+                print(f"response_json_obj: {response_json_obj}")
+                if response_json_obj.get("error") and response_json_obj.get("message"):
+                    error_message = (
+                        response_json_obj.get("error")
+                        + ": "
+                        + response_json_obj.get("message")
+                    )
+                elif response_json_obj.get("error") and not response_json_obj.get(
+                    "message"
+                ):
+                    error_message = response_json_obj.get("error")
+            return {}, error_message, response_obj.status_code
+
+        if product_name == "Mobile Fintech SA":
+            product_name = "Mobile Fintech SA (Pty) Ltd"
+
+        if response_obj.status_code == 200:
+            product_list = response_obj.json()
+
+            # print(f"product_list: {product_list}")
+            for product in product_list:
+                # print(f"product: {product.get("ProductName").lower()}, product_name: {product_name.lower()}, does it match: {product.get("ProductName").lower().replace("–", "-") == product_name.lower().replace("–", "-")} \n")
+                if product.get("ProductName").strip().lower().replace("–", "-").replace(" ", "") == product_name.strip().lower().replace("–", "-").replace(" ", ""):
+                    product_details["product_id"] = product.get("ProductID")
+                    product_details["product_contact"] = product.get("ContactName")
+                    # print(f"product_details: {product_details} \n")
+                    break
+        
+        # general_helpers.fnLogToPapertrail(oStamp,f"get_product_id product details: {product_details}\n")
+        
+        return product_details, "Chase get product status=200,", response_obj.status_code
+    except requests.exceptions.RequestException as e:
+        # Catch all requests-related exceptions
+        resp_obj, status_code = general_helpers.fnLogToPapertrail(oStamp, e)
+        print(f"Exception in get_product_id: {e}")
+    except Exception as e:  ## EXCEPTION MUST BE THE LAST HANDLER
+        e_type, e_object, e_traceback = sys.exc_info()
+        estr = f"get_product_id method returned exception ERROR line {e_traceback.tb_lineno}: error message => {str(e)}."
+        print(estr)
+        return {}, estr, 106
+    finally:
+        session.close()
+
+
+def get_business_unit_id(business_unit):
+    business_unit_id = None
+    # product_id = 4452
+    try:
+
+        url = f"{get_chase_url()}/api/BusinessUnit"
+
+        headers = {
+            "ConfigID": configID,
+        }
+
+        response_obj = session.get(
+            url,
+            auth=get_basic_auth(),  # Basic Auth
+            headers=headers,  # Custom headers
+            verify=False,  # Disable SSL verification (use True in production)
+            timeout=timeout,  # Timeout in seconds
+        )
+
+        if response_obj.status_code == 200:
+            unit_list = response_obj.json()
+
+            for business in unit_list:
+                if business.get("BusinessUnit") == business_unit:
+                    business_unit_id = business.get("BusinessUnitID")
+                    break
+
+        if response_obj.status_code != 200:
+            # print(resp.text)
+            error_message = response_obj.text
+            if isinstance(response_obj, object):
+                response_json_obj = response_obj.json()
+                print(f"response_json_obj: {response_json_obj}")
+                if response_json_obj.get("error") and response_json_obj.get("message"):
+                    error_message = (
+                        response_json_obj.get("error")
+                        + ": "
+                        + response_json_obj.get("message")
+                    )
+                elif response_json_obj.get("error") and not response_json_obj.get(
+                    "message"
+                ):
+                    error_message = response_json_obj.get("error")
+            return {}, error_message, response_obj.status_code
+
+        return (
+            business_unit_id,
+            "Chase get business unit id status=200,",
+            response_obj.status_code,
+        )
+    except requests.exceptions.RequestException as e:
+        # print("Took too long to respond")
+        return {}, "Chase took too long to respond, Probably a vpn issue", 108
+    except Exception as e:  ## EXCEPTION MUST BE THE LAST HANDLER
+        e_type, e_object, e_traceback = sys.exc_info()
+        estr = f"get_business_unit_id method returned exception ERROR line {e_traceback.tb_lineno}: error message => {str(e)}."
+        return {}, estr, 106
+    finally:
+        session.close()
+
+
+def get_user_id(user_name, pipe_id):
+    user_id = None
+    user_email = None
+    # product_id = 4452
+    dydx_users = [
+        "Ross Holmes",
+        "Jason Blignaut",
+        "Jess Shepherd",
+        "Pearl Phahlane",
+        "Nevo nevo@dydx.digital",
+        "Duncan Van Heerden",
+        "Abigail Hlalele",
+        "Jean Niho",
+        "Dylan Aigner",
+        "upandupbot",
+    ]
+    try:
+
+        url = f"{get_chase_url()}/api/User/GetUsers"
+
+        headers = {
+            "ConfigID": configID,
+        }
+
+        response_obj = requests.get(
+            url, auth=get_basic_auth(), headers=headers, timeout=20, verify=False
+        )
+
+        if response_obj.status_code == 200:
+            user_list = response_obj.json()
+
+            pipefy_user_info_raw = pipefy.get_users(pipe_id)
+            # print(f"Fetching phase fields from Pipefy...\n {user_info_raw}")
+            pipefy_user_info_list = pipefy_user_info_raw["data"]["pipe"]["users"]
+
+            for pipefy_user_info in pipefy_user_info_list:
+                # print(f"pipefy_user_info: {pipefy_user_info} \n")
+                if pipefy_user_info.get("name") == user_name:
+                    user_email = pipefy_user_info.get("email")
+                    print(f"get_user_id user_email: {user_email}, pipefy user info: {pipefy_user_info} \n")
+                    break
+
+            for user in user_list:
+                if user_name in dydx_users:
+                    user_email = "ross.holmes@theupandupgroup.com"
+                if user.get("email") == user_email:
+                    user_id = user.get("userid")
+                    print(f"get_user_id user_id: {user}, user_name: {user_name}, user_email: {user_email} \n")
+                    break
+        else:
+            # print(resp.text)
+            error_message = response_obj.text
+            if isinstance(response_obj, object):
+                response_json_obj = response_obj.json()
+                print(f"response_json_obj: {response_json_obj}")
+                if response_json_obj.get("error") and response_json_obj.get("message"):
+                    error_message = (
+                        response_json_obj.get("error")
+                        + ": "
+                        + response_json_obj.get("message")
+                    )
+                elif response_json_obj.get("error") and not response_json_obj.get(
+                    "message"
+                ):
+                    error_message = response_json_obj.get("error")
+            return {}, error_message, response_obj.status_code
+        
+        print(f"get_user_id user_id: {user_id}, user_name: {user_name}, user_email: {user_email} \n")
+        if user_id is None:
+            return None, f"Chase get user ID status=200, No user found for {user_name}", 200
+        return user_id, "Chase get user ID status=200,", response_obj.status_code
+    except requests.exceptions.Timeout:
+        print("Took too long to respond")
+        return {}, "Chase took too long to respond, Probably a vpn issue", 108
+    except Exception as e:  ## EXCEPTION MUST BE THE LAST HANDLER
+        e_type, e_object, e_traceback = sys.exc_info()
+        print(f"get_user_id method returned exception ERROR line {e_traceback.tb_lineno}: error message => {str(e)}.\n")
+        print(pipefy_user_info)
+        estr = f"get_user_id method returned exception ERROR line {e_traceback.tb_lineno}: error message => {str(e)}."
+        return 2507, estr, 106
+
+
+def get_client_contact(contact_name):
+    try:
+
+        url = f"{get_chase_url()}/api/Contact/Search/{contact_name}"
+
+        headers = {
+            "ConfigID": configID,
+        }
+
+        response_obj = requests.get(
+            url, auth=get_basic_auth(), headers=headers, timeout=20, verify=False
+        )
+
+        if response_obj.status_code == 200:
+            if isinstance(response_obj.json(), list) and len(response_obj.json()) > 0:
+                contact_id = response_obj.json()[0].get("ContactID")
+                contact_email = response_obj.json()[0].get("Email")
+            else:
+                return None, None, "Chase get client contact status=200, No contact found"
+        else:
+            # print(resp.text)
+            error_message = response_obj.text
+            if isinstance(response_obj, object):
+                response_json_obj = response_obj.json()
+                print(f"response_json_obj: {response_json_obj}")
+                if response_json_obj.get("error") and response_json_obj.get("message"):
+                    error_message = (
+                        response_json_obj.get("error")
+                        + ": "
+                        + response_json_obj.get("message")
+                    )
+                elif response_json_obj.get("error") and not response_json_obj.get(
+                    "message"
+                ):
+                    error_message = response_json_obj.get("error")
+            return None, {}, error_message
+
+        return contact_id, contact_email, "Chase get client number status=200,"
+    except requests.exceptions.Timeout:
+        # print("Took too long to respond")
+        return None, "Chase took too long to respond, Probably a vpn issue", 108
+    except Exception as e:  ## EXCEPTION MUST BE THE LAST HANDLER
+        e_type, e_object, e_traceback = sys.exc_info()
+        estr = f"get_client_contact method returned exception ERROR line {e_traceback.tb_lineno}: error message => {str(e)}."
+        return None, estr, 106
+
+
+def get_job_by_id(job_bag_id):
+    job_bag_data = None
+    try:
+
+        url = f"{get_chase_url()}/api/Job/{job_bag_id}"
+
+        headers = {
+            "ConfigID": configID,
+        }
+
+        response_obj = requests.get(
+            url, auth=get_basic_auth(), headers=headers, timeout=20, verify=False
+        )
+
+        # job_bag_data = dummy_job_bag[0]
+
+        if response_obj.status_code != 200:
+            # print(resp.text)
+            error_message = response_obj.text
+            if isinstance(response_obj, object):
+                response_json_obj = response_obj.json()
+                print(f"response_json_obj: {response_json_obj}")
+                if response_json_obj.get("error") and response_json_obj.get("message"):
+                    error_message = (
+                        response_json_obj.get("error")
+                        + ": "
+                        + response_json_obj.get("message")
+                    )
+                elif response_json_obj.get("error") and not response_json_obj.get(
+                    "message"
+                ):
+                    error_message = response_json_obj.get("error")
+            return {}, error_message, response_obj.status_code
+        else:
+            if isinstance(response_obj.json(), list) and len(response_obj.json()) > 0:
+                job_bag_data = response_obj.json()[0]
+            else:
+                return {}, "Chase get job bag status=200, No job bag found", 108
+
+        return job_bag_data, "Chase get job bag status=200,", response_obj.status_code
+    except requests.exceptions.Timeout:
+        # print("Took too long to respond")
+        return {}, "Chase took too long to respond, Probably a vpn issue", 108
+    except Exception as e:  ## EXCEPTION MUST BE THE LAST HANDLER
+        e_type, e_object, e_traceback = sys.exc_info()
+        estr = f"get_job_by_id method returned exception ERROR line {e_traceback.tb_lineno}: error message => {str(e), job_bag_id}."
+        return {}, estr, 106
+
+
+def get_job_by_number(job_bag_number):
+    job_bag_data = None
+    try:
+
+        url = f"{get_chase_url()}/api/Job/JobNo/{job_bag_number}"
+
+        headers = {
+            "ConfigID": configID,
+        }
+
+        response_obj = requests.get(
+            url, auth=get_basic_auth(), headers=headers, timeout=20, verify=False
+        )
+
+        # job_bag_data = dummy_job_bag[0]
+        if response_obj.status_code == 200:
+            if isinstance(response_obj.json(), list) and len(response_obj.json()) > 0:
+                job_bag_data = response_obj.json()[0]
+                return (
+                    job_bag_data,
+                    "Chase get job bag status=200,",
+                    response_obj.status_code,
+                )
+            else:
+                return {}, "Chase get job bag status=200, No job bag found", 108
+        else:
+            # print(resp.text)
+            error_message = response_obj.text
+            if isinstance(response_obj, object):
+                response_json_obj = response_obj.json()
+                print(f"response_json_obj: {response_json_obj}")
+                if response_json_obj.get("error") and response_json_obj.get("message"):
+                    error_message = (
+                        response_json_obj.get("error")
+                        + ": "
+                        + response_json_obj.get("message")
+                    )
+                elif response_json_obj.get("error") and not response_json_obj.get(
+                    "message"
+                ):
+                    error_message = response_json_obj.get("error")
+            return {}, error_message, response_obj.status_code
+
+    except requests.exceptions.Timeout:
+        # print("Took too long to respond")
+        return {}, "Chase took too long to respond, Probably a vpn issue", 108
+    except Exception as e:  ## EXCEPTION MUST BE THE LAST HANDLER
+        e_type, e_object, e_traceback = sys.exc_info()
+        estr = f"get_job_by_number method returned exception ERROR line {e_traceback.tb_lineno}: error message => {str(e)}."
+        return {}, estr, 106
+
+
+def get_job_category_id(brief_type, element, other_element, pipe_name, selected_channel, selected_retail_element):
+    oStamp["time"] = datetime.now(tz).strftime("%Y:%m:%d %H:%M:%S")
+    oStamp["cardid"] = 12345678
+    
+    # general_helpers.fnLogToPapertrail(oStamp,f"category details: '{brief_type}', '{element}', '{other_element}', '{selected_retail_element}'\n")
+    
+    category_id = None
+    element_lower = None
+    mapped_category = None
+    # retail_element_category = None
+    
+    try:
+        if selected_retail_element is not None:
+            retail_element_category = selected_retail_element.strip().lower().replace("/", "").replace("  ", "_").replace(" ", "_")
+        # product_id = 4452
+        # if this is an element card then we need to pull the corresponding category for the element from the category_map
+        if element is not None:
+            element_lower = element.replace(" ", "").lower()
+        
+        if brief_type == "Integrated" or brief_type == "Toolkit":
+            mapped_category = "TTL"
+        elif brief_type == "PR":
+            mapped_category = "PR/Press"
+        elif brief_type == "Production only":
+            mapped_category = "Production"
+        elif brief_type == "Media":
+            mapped_category = "Media"
+        elif brief_type == "Social":
+            mapped_category = "Social Media"
+        elif brief_type == "Internal communications":
+            mapped_category = "BTL"
+        elif pipe_name == "Account Management" and element is None:
+            # get the category name from the category_map for the element
+            if brief_type == "Retail":
+                mapped_category = "BTL"
+            else:
+                mapped_category = brief_type
+        elif element is not None or other_element is not None:
+            if selected_channel == "Internal Marketing":
+                brief_type = "Digital"
+            if other_element is not None:
+                mapped_category = brief_type
+                if brief_type == "Retail":
+                    mapped_category = "BTL"
+            elif brief_type in category_map:
+                sub_category = category_map[brief_type]
+                if brief_type == "Retail":
+                    mapped_category = sub_category.get(retail_element_category, {}).get(element_lower)
+                else:
+                    mapped_category = sub_category.get(element_lower, brief_type)
+        else:
+            mapped_category = brief_type
+            if brief_type == "Retail" or brief_type == "Internal communications":
+                mapped_category = "BTL"
+
+        # general_helpers.fnLogToPapertrail(oStamp,f"category details: '{brief_type}', '{mapped_category}', '{element_lower}', '{other_element}', '{selected_retail_element}'\n")
+
+        # message = (
+        #     f"brief_type: {brief_type}, mapped_category: {mapped_category}, element_lower: {element_lower}\n\n"
+        # )
+        # resp_obj, status_code = general_helpers.fnLogToPapertrail({}, message)
+
+        url = f"{get_chase_url()}/api/Lists/GetJobCategories"
+
+        headers = {
+            "ConfigID": configID,
+        }
+
+        response_obj = requests.get(
+            url, auth=get_basic_auth(), headers=headers, timeout=20, verify=False
+        )
+
+        if response_obj.status_code == 200:
+            category_list = response_obj.json()
+
+            for category in category_list:
+                if category.get("CategoryName") == mapped_category:
+                    category_id = category.get("CategoryID")
+                    break
+                else:
+                    category_id = None
+
+        if response_obj.status_code != 200:
+            # print(resp.text)
+            error_message = response_obj.text
+            if isinstance(response_obj, object):
+                response_json_obj = response_obj.json()
+                print(f"response_json_obj: {response_json_obj}")
+                if response_json_obj.get("error") and response_json_obj.get("message"):
+                    error_message = (
+                        response_json_obj.get("error")
+                        + ": "
+                        + response_json_obj.get("message")
+                    )
+                elif response_json_obj.get("error") and not response_json_obj.get(
+                    "message"
+                ):
+                    error_message = response_json_obj.get("error")
+            return {}, error_message, response_obj.status_code
+
+        return category_id, "Chase get category status=200,", response_obj.status_code
+    except requests.exceptions.Timeout:
+        # print("Took too long to respond")
+        return {}, "Chase took too long to respond, Probably a vpn issue", 108
+    except Exception as e:  ## EXCEPTION MUST BE THE LAST HANDLER
+        e_type, e_object, e_traceback = sys.exc_info()
+        estr = f"get_category_id method returned exception ERROR line {e_traceback.tb_lineno}: error message => {str(e)}."
+        return {}, estr, 106
+
+
+def get_job_required_fields(job_bag_id):
+    job_bag_data = None
+    try:
+
+        url = f"{get_chase_url()}/api/Job/RequiredFields/{job_bag_id}"
+
+        headers = {
+            "ConfigID": configID,
+        }
+
+        response_obj = requests.get(
+            url, auth=get_basic_auth(), headers=headers, timeout=20, verify=False
+        )
+
+        if response_obj.status_code == 200:
+            if isinstance(response_obj.json(), list) and len(response_obj.json()) > 0:
+                job_bag_data = response_obj.json()[0]
+                return (
+                    job_bag_data,
+                    "Chase get job bag status=200,",
+                    response_obj.status_code,
+                )
+            else:
+                return {}, "Chase get job bag status=200, No job bag found", 108
+        else:
+            # print(resp.text)
+            error_message = response_obj.text
+            if isinstance(response_obj, object):
+                response_json_obj = response_obj.json()
+                print(f"response_json_obj: {response_json_obj}")
+                if response_json_obj.get("error") and response_json_obj.get("message"):
+                    error_message = (
+                        response_json_obj.get("error")
+                        + ": "
+                        + response_json_obj.get("message")
+                    )
+                elif response_json_obj.get("error") and not response_json_obj.get(
+                    "message"
+                ):
+                    error_message = response_json_obj.get("error")
+            return {}, error_message, response_obj.status_code
+
+    except requests.exceptions.Timeout:
+        # print("Took too long to respond")
+        return {}, "Chase took too long to respond, Probably a vpn issue", 108
+    except Exception as e:  ## EXCEPTION MUST BE THE LAST HANDLER
+        e_type, e_object, e_traceback = sys.exc_info()
+        estr = f"get_job_required_fields method returned exception ERROR line {e_traceback.tb_lineno}: error message => {str(e)}."
+        return {}, estr, 106
+
+
+def update_required_fields(job_bag_obj, card_details, card_id, client_contact_id, ostamp):
+    try:
+        # Parse the input date into a datetime object
+        if (card_details.get("trafficker") is None or "") or (card_details.get("account_manager") is None or ""):
+            card_details, message, status_code = pipefy.get_card_details(card_id)
+            general_helpers.fnLogToPapertrail(ostamp, f"Trafficker or AM not found, fetching card details again")
+
+        pipe_id = card_details["pipe_object"].get("id")
+        job_deadline = card_details.get("job_deadline")
+        go_live_date = card_details.get("go_live_date")
+        trafficker = card_details.get("trafficker")
+        account_manager = card_details.get("account_manager")
+        if job_deadline is None:
+            job_deadline = go_live_date
+            job_date_obj = datetime.strptime(job_deadline, "%d/%m/%Y")
+        else:
+            job_date_obj = datetime.strptime(job_deadline, "%d/%m/%Y %H:%M")
+        
+        
+        if go_live_date is not None:
+            media_date_obj = datetime.strptime(go_live_date, "%d/%m/%Y")
+            formatted_media_date = (
+                media_date_obj.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "+02:00"
+            )
+            job_bag_obj["StartDate"] = formatted_media_date
+
+        # Convert the datetime object to the desired ISO 8601 format with timezone offset
+        formatted_job_date = (
+            job_date_obj.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "+02:00"
+        )
+        
+        # print(f"trafficker: {trafficker}, type: {type(trafficker)} \n")
+
+        # Try to parse as JSON list first
+        trafficker_list = []
+        if isinstance(trafficker, str):
+            s = trafficker.strip()
+            if s.startswith("[") and s.endswith("]"):
+                try:
+                    trafficker_list = json.loads(s)
+                except Exception:
+                    # fallback: split by comma
+                    trafficker_list = [name.strip(' "\'') for name in s[1:-1].split(",")]
+            elif "," in s:
+                trafficker_list = [name.strip(' "\'') for name in s.split(",")]
+            elif s:
+                trafficker_list = [s.strip(' "\'')]
+        elif isinstance(trafficker, list):
+            trafficker_list = trafficker
+        elif trafficker is not None:
+            trafficker_list = [str(trafficker)]
+
+        account_manager_list = []
+        if isinstance(account_manager, str):
+            s = account_manager.strip()
+            if s.startswith("[") and s.endswith("]"):
+                try:
+                    account_manager_list = json.loads(s)
+                except Exception:
+                    # fallback: split by comma
+                    account_manager_list = [name.strip(' "\'') for name in s[1:-1].split(",")]
+            elif "," in s:
+                account_manager_list = [name.strip(' "\'') for name in s.split(",")]
+            elif s:
+                account_manager_list = [s.strip(' "\'')]
+        elif isinstance(account_manager, list):
+            account_manager_list = account_manager
+        elif account_manager is not None:
+            account_manager_list = [str(account_manager)]
+
+        print(f"trafficker_list: {trafficker_list}")
+        
+        # Initialize IDs to None
+        trafficker_id = None
+        account_manager_id = None
+        
+        if trafficker_list:
+            trafficker_id, error_message, status_code = get_user_id(trafficker_list[0], pipe_id)
+        if account_manager_list:
+            account_manager_id, error_message, status_code = get_user_id(account_manager_list[0], pipe_id)
+        elif trafficker_list is None and account_manager_list:
+            trafficker_id, error_message, status_code = get_user_id(account_manager_list[0], pipe_id)
+            general_helpers.fnLogToPapertrail(ostamp, f"Trafficker not found, defaulting to {account_manager_list[0]}, trafficker value: {trafficker}")
+        else:
+            trafficker_id, error_message, status_code = get_user_id("Ross Holmes", pipe_id)
+            general_helpers.fnLogToPapertrail(ostamp, f"Trafficker not found, defaulting to Ross Holmes, trafficker value: {trafficker}")
+
+        if trafficker_id is None:
+            trafficker_id = 2507  # Default to a known user ID if not found
+            general_helpers.fnLogToPapertrail(ostamp, f"Trafficker not found, defaulting to Ross Holmes, account manager value: {account_manager_list}")
+        if account_manager_id is None:
+            account_manager_id = 2507  # Default to a known user ID if not found
+            general_helpers.fnLogToPapertrail(ostamp, f"Account Manager not found, defaulting to Ross Holmes, account manager value: {account_manager}")
+
+        print(f"account_manager_id: {account_manager_id}, account_manager: {account_manager_list[0] if account_manager_list else 'None'}\n")
+
+        division_id = card_details.get("division_id")
+        job_bag_fields = {
+            "BusinessUnitID": 11,
+            "DeliveryDate": formatted_job_date,
+            "TrafficUserID": trafficker_id,
+        }
+
+        job_bag_obj["UserID"] = account_manager_id
+
+        # Check and assign the billing category
+        billing_category = card_details.get("billing_category")
+        if billing_category is not None:
+            billing_category = billing_category.replace(" ", "").lower()
+            category_id = billing_categories.get(billing_category)
+            if category_id is None:
+                # If the billing category is not found in the dictionary, set a default value or handle the error
+                category_id = 453
+            job_bag_obj["BillingCategoryID"] = category_id
+        else:
+            job_bag_obj["BillingCategoryID"] = 453
+
+        # message = f"Billing Category: {billing_category}, Billing category ID: {job_bag_obj['BillingCategoryID']}"
+        # resp_obj, status_code = general_helpers.fnLogToPapertrail(ostamp, message)
+        # Update fields in job_bag_obj with the remainging fields
+        for key, value in job_bag_fields.items():
+            if key in job_bag_obj:
+                job_bag_obj[key] = value
+
+        # get the parent job bag id from the parent job number
+        if card_details.get("parent_job_number") is not None:
+            parent_job_bag_obj, error_message, status_code = get_job_by_number(
+                card_details.get("parent_job_number")
+            )
+            parent_job_bag_id = parent_job_bag_obj.get("JobID")
+            job_bag_obj["ParentJobID"] = parent_job_bag_id
+
+        # add the last remaing fields to the job bag object
+        if client_contact_id is not None:
+            job_bag_obj["ContactID"] = client_contact_id
+
+        print(f"job_bag_obj: {job_bag_obj} \n")
+
+        # print(f"division_id: {division_id} \n")
+        
+        if division_id is not None:
+            job_bag_obj["DivisionID"] = division_id
+        
+        # message = f"product: {division_id}, job_bag_obj: {job_bag_obj}, card_details: {card_details}"
+        # resp_obj, status_code = general_helpers.fnLogToPapertrail(oStamp, message)
+
+        url = f"{get_chase_url()}/api/Job/UpdateSpecificFields"
+
+        headers = {
+            "Content-Type": "application/json",
+            "ConfigID": configID,
+        }
+
+        response_obj = requests.post(
+            url,
+            auth=get_basic_auth(),
+            headers=headers,
+            json=job_bag_obj,
+            timeout=20,
+            verify=False,
+        )
+
+        if response_obj.status_code != 200:
+            # print(resp.text)
+            error_message = response_obj.text
+            if isinstance(response_obj, object):
+                response_json_obj = response_obj.json()
+                print(f"required job bag response_json_obj: {response_json_obj}")
+                if response_json_obj.get("error") and response_json_obj.get("message"):
+                    error_message = (
+                        response_json_obj.get("error")
+                        + ": "
+                        + response_json_obj.get("message")
+                    )
+                elif response_json_obj.get("error") and not response_json_obj.get(
+                    "message"
+                ):
+                    error_message = response_json_obj.get("error")
+            return {}, error_message, response_obj.status_code
+
+        print(f"response_obj for update specific fields: {response_obj} \n")
+        return True, "Chase update Job Bag status=200", 200
+
+    except requests.exceptions.Timeout:
+        # print("Took too long to respond")
+        return {}, "Chase took too long to respond, Probably a vpn issue", 108
+    except Exception as e:  ## EXCEPTION MUST BE THE LAST HANDLER
+        e_type, e_object, e_traceback = sys.exc_info()
+        estr = {}
+        estr["message"] = (
+            f"update_required_fields method returned exception ERROR line {e_traceback.tb_lineno}: error message => {str(e)}."
+        )
+        estr["job_bag_obj"] = job_bag_obj
+        estr["card_details"] = card_details
+        general_helpers.fnLogToPapertrail(oStamp, estr)
+        return {}, estr, 106

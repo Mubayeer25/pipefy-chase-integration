@@ -1,0 +1,11 @@
+# Secrets
+segredo.ini
+*.ini
+.env
+config/secret*
+credentials*
+
+# Python environment
+venv/
+__pycache__/
+*.pyc
